@@ -212,27 +212,26 @@ def current_ip():
         return "获取失败"
 
 
-def build_check_message(sid, status, ip):
+REPORT = []
+DIVIDER = "━━━━━━━━━━━━━━━━"
+TG_LIMIT = 3800
+
+
+def record(sid, kind, lines):
+    """记录一台服务器的结果，最后合并成一条 Telegram 消息发送。
+    kind: not_due / success / error / skipped
+    """
+    REPORT.append({"sid": sid, "kind": kind, "lines": lines})
+
+
+def record_not_due(sid, status):
     days = get_days(status)
     renew_date = estimate_renew_date(status)
-    now = beijing_now()
 
-    lines = [
-        "⏳ Host-Ship 检查完成",
-        "",
-        f"🖥️ 服务器：#{sid}",
-        f"👤 账号：{account_text()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-        "🔒 当前状态：未到续期时间",
-    ]
+    lines = ["🔒 未到续期时间"]
 
     if days is not None:
-        lines.append(
-            f"⏱️ 距离续期：约 {days} 天"
-        )
+        lines.append(f"⏱️ 距离续期：约 {days} 天")
 
     if renew_date is not None:
         lines.append(
@@ -241,70 +240,123 @@ def build_check_message(sid, status, ip):
         )
 
     if days is None:
-        lines.append(
-            f"📅 面板状态：{status}"
-        )
+        lines.append(f"📅 面板状态：{status}")
 
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
-    )
-
-    return "\n".join(lines)
+    record(sid, "not_due", lines)
 
 
-def build_success_message(sid, before, after, ip):
+def record_success(sid, before, after):
     before_days = get_days(before)
     after_days = get_days(after)
-    now = beijing_now()
 
-    lines = [
-        "🎉 Host-Ship 续期成功",
-        "",
-        f"🖥️ 服务器：#{sid}",
-        f"👤 账号：{account_text()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 续期时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-    ]
-
-    if before_days is not None:
-        lines.append(
-            f"📅 续期前：约 {before_days} 天"
-        )
-    else:
-        lines.append(
-            f"📅 续期前：{before}"
-        )
-
-    if after_days is not None:
-        lines.append(
-            f"✅ 续期后：约 {after_days} 天"
-        )
-    else:
-        lines.append(
-            f"✅ 续期后：{after}"
-        )
-
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
+    record(
+        sid,
+        "success",
+        [
+            "🎉 续期成功",
+            "📅 续期前："
+            + (
+                f"约 {before_days} 天"
+                if before_days is not None
+                else str(before)
+            ),
+            "✅ 续期后："
+            + (
+                f"约 {after_days} 天"
+                if after_days is not None
+                else str(after)
+            ),
+        ],
     )
 
-    return "\n".join(lines)
+
+def record_error(sid, title, reason):
+    record(sid, "error", [title, f"⚠️ 原因：{reason}"])
 
 
-def build_error_message(sid, title, reason, ip):
+def record_skipped(sid, reason):
+    record(sid, "skipped", [f"⏭️ 已跳过：{reason}"])
+
+
+def flush_report(ip):
+    """把所有服务器的结果合并成一条（过长时按分割线拆成多条）发送。
+
+    定时运行：只有出现续期/失败时才发；手动运行：始终发送。
+    """
+    if not REPORT:
+        return
+
+    count = {"success": 0, "not_due": 0, "error": 0, "skipped": 0}
+
+    for item in REPORT:
+        count[item["kind"]] += 1
+
+    bad = count["error"] + count["skipped"]
+
+    if not (MANUAL_RUN or bad or count["success"]):
+        log("ℹ️ 全部未到续期时间，无需发送通知")
+        return
+
+    if bad:
+        title = "⚠️ Host-Ship 运行报告（有异常）"
+    elif count["success"]:
+        title = "🎉 Host-Ship 续期完成"
+    else:
+        title = "⏳ Host-Ship 检查完成"
+
+    parts = []
+
+    if count["success"]:
+        parts.append(f"续期成功 {count['success']}")
+
+    if count["not_due"]:
+        parts.append(f"未到期 {count['not_due']}")
+
+    if bad:
+        parts.append(f"异常 {bad}")
+
     now = beijing_now()
 
-    return (
-        f"{title}\n\n"
-        f"🖥️ 服务器：#{sid}\n"
-        f"👤 账号：{account_text()}\n"
-        f"🌐 节点状态：{node_status()}\n"
-        f"📍 出口IP：{ip}\n"
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}\n\n"
-        f"⚠️ 原因：{reason}"
+    header = "\n".join(
+        [
+            title,
+            "",
+            f"👤 账号：{account_text()}",
+            f"🌐 节点状态：{node_status()}",
+            f"📍 出口IP：{ip}",
+            f"🕗 时间：{now.strftime('%Y/%m/%d %H:%M')}",
+            f"📊 共 {len(REPORT)} 台：" + "，".join(parts),
+        ]
     )
+
+    blocks = []
+
+    for item in REPORT:
+        head = (
+            "🔎 自动扫描"
+            if item["sid"] == "自动扫描"
+            else f"🖥️ 服务器 #{item['sid']}"
+        )
+
+        blocks.append("\n".join([head] + item["lines"]))
+
+    footer = "⏰ 自动检查：每天 08:00（北京时间）"
+
+    messages = []
+    current = header
+
+    for block in blocks:
+        if len(current) + len(block) + len(DIVIDER) + 4 > TG_LIMIT:
+            messages.append(current)
+            current = block
+        else:
+            current += f"\n{DIVIDER}\n{block}"
+
+    current += f"\n{DIVIDER}\n{footer}"
+    messages.append(current)
+
+    for message in messages:
+        tg(message)
 
 
 def first_visible(page, selectors):
@@ -708,12 +760,6 @@ def discover_servers(page):
     return urls
 
 
-def notify_not_due(sid, status, ip):
-    """未到续期时间：仅手动运行时发 Telegram。"""
-    if MANUAL_RUN:
-        tg(build_check_message(sid, status, ip))
-
-
 def process_server(page, url, sid, ip):
     """处理单台服务器，返回 0 成功/无需操作，1 失败，LOGIN_FAILED 登录失败。"""
     if not login_if_needed(page, url):
@@ -722,13 +768,10 @@ def process_server(page, url, sid, ip):
             full_page=True,
         )
 
-        tg(
-            build_error_message(
-                sid,
-                "❌ Host-Ship 登录失败",
-                "登录失败或遇到安全验证",
-                ip,
-            )
+        record_error(
+            sid,
+            "❌ 登录失败",
+            "登录失败或遇到安全验证",
         )
 
         return LOGIN_FAILED
@@ -759,7 +802,7 @@ def process_server(page, url, sid, ip):
     if re.search(r"Renew\s+Limit\s+Reached", body, re.I):
         log("⏳ 目前未到续期时间，不进行操作")
 
-        notify_not_due(sid, before, ip)
+        record_not_due(sid, before)
 
         return 0
 
@@ -771,13 +814,10 @@ def process_server(page, url, sid, ip):
             full_page=True,
         )
 
-        tg(
-            build_error_message(
-                sid,
-                "⚠️ Host-Ship 需要检查",
-                f"没有找到可用的 Renew 按钮；{before}",
-                ip,
-            )
+        record_error(
+            sid,
+            "⚠️ 需要检查",
+            f"没有找到可用的 Renew 按钮；{before}",
         )
 
         return 1
@@ -790,7 +830,7 @@ def process_server(page, url, sid, ip):
     if disabled:
         log("⏳ Renew 按钮当前不可点击")
 
-        notify_not_due(sid, before, ip)
+        record_not_due(sid, before)
 
         return 0
 
@@ -804,13 +844,10 @@ def process_server(page, url, sid, ip):
             full_page=True,
         )
 
-        tg(
-            build_error_message(
-                sid,
-                "❌ Host-Ship 续期确认失败",
-                "点击第一层 Renew 后，未能点击确认弹窗中的 Renew now",
-                ip,
-            )
+        record_error(
+            sid,
+            "❌ 续期确认失败",
+            "点击第一层 Renew 后，未能点击确认弹窗中的 Renew now",
         )
 
         return 1
@@ -820,7 +857,7 @@ def process_server(page, url, sid, ip):
     if success:
         log(f"✅ 续期成功：{before} -> {after}")
 
-        tg(build_success_message(sid, before, after, ip))
+        record_success(sid, before, after)
 
         return 0
 
@@ -831,13 +868,10 @@ def process_server(page, url, sid, ip):
 
     log("⚠️ 已点击续期，但无法确认结果")
 
-    tg(
-        build_error_message(
-            sid,
-            "⚠️ Host-Ship 续期结果需要检查",
-            f"续期前：{before}；续期后：{after}",
-            ip,
-        )
+    record_error(
+        sid,
+        "⚠️ 续期结果需要检查",
+        f"续期前：{before}；续期后：{after}",
     )
 
     return 1
@@ -871,123 +905,116 @@ def main():
 
     results = {}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            proxy={"server": PROXY_SERVER} if IS_PROXY else None,
-            args=["--no-sandbox"],
-        )
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                proxy={"server": PROXY_SERVER} if IS_PROXY else None,
+                args=["--no-sandbox"],
+            )
 
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-        )
+            context = browser.new_context(
+                viewport={
+                    "width": 1440,
+                    "height": 1000,
+                },
+                user_agent=(
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/128.0.0.0 Safari/537.36"
+                ),
+            )
 
-        page = context.new_page()
+            page = context.new_page()
 
-        try:
-            if not urls:
-                log("🔎 未配置 SERVER_URL，自动扫描账号下的服务器...")
+            try:
+                if not urls:
+                    log("🔎 未配置 SERVER_URL，自动扫描账号下的服务器...")
 
-                found = discover_servers(page)
+                    found = discover_servers(page)
 
-                if found is None:
-                    page.screenshot(
-                        path="hostship_discover_login_fail.png",
-                        full_page=True,
-                    )
-
-                    tg(
-                        build_error_message(
-                            "自动扫描",
-                            "❌ Host-Ship 登录失败",
-                            "登录失败或遇到安全验证",
-                            ip,
-                        )
-                    )
-
-                    return 1
-
-                if not found:
-                    page.screenshot(
-                        path="hostship_discover_empty.png",
-                        full_page=True,
-                    )
-
-                    tg(
-                        build_error_message(
-                            "自动扫描",
-                            "⚠️ Host-Ship 未发现服务器",
-                            "仪表盘上没有找到服务器链接，"
-                            "请改为手动配置 SERVER_URL",
-                            ip,
-                        )
-                    )
-
-                    return 1
-
-                urls = found
-
-                log(
-                    f"✅ 发现 {len(urls)} 台服务器："
-                    + ", ".join(server_id(u) for u in urls)
-                )
-
-            for index, url in enumerate(urls, start=1):
-                sid = server_id(url)
-
-                log(f"━━ [{index}/{len(urls)}] 服务器 #{sid} ━━")
-
-                try:
-                    code = process_server(page, url, sid, ip)
-
-                except Exception as exc:
-                    log(f"❌ 运行异常：{exc}")
-
-                    try:
+                    if found is None:
                         page.screenshot(
-                            path=f"hostship_{sid}_error.png",
+                            path="hostship_discover_login_fail.png",
                             full_page=True,
                         )
-                    except Exception:
-                        pass
 
-                    tg(
-                        build_error_message(
-                            sid,
-                            "❌ Host-Ship 自动续期异常",
-                            str(exc),
-                            ip,
+                        record_error(
+                            "自动扫描",
+                            "❌ 登录失败",
+                            "登录失败或遇到安全验证",
                         )
+
+                        return 1
+
+                    if not found:
+                        page.screenshot(
+                            path="hostship_discover_empty.png",
+                            full_page=True,
+                        )
+
+                        record_error(
+                            "自动扫描",
+                            "⚠️ 未发现服务器",
+                            "仪表盘上没有找到服务器链接，"
+                            "请改为手动配置 SERVER_URL",
+                        )
+
+                        return 1
+
+                    urls = found
+
+                    log(
+                        f"✅ 发现 {len(urls)} 台服务器："
+                        + ", ".join(server_id(u) for u in urls)
                     )
 
-                    code = 1
+                for index, url in enumerate(urls, start=1):
+                    sid = server_id(url)
 
-                results[sid] = code
+                    log(f"━━ [{index}/{len(urls)}] 服务器 #{sid} ━━")
 
-                # 登录/验证码问题对同一账号的所有服务器都一样，不再继续
-                if code == LOGIN_FAILED:
-                    for rest in urls[index:]:
-                        results[server_id(rest)] = LOGIN_FAILED
+                    try:
+                        code = process_server(page, url, sid, ip)
 
-                    log("⛔ 登录失败，跳过剩余服务器")
-                    break
+                    except Exception as exc:
+                        log(f"❌ 运行异常：{exc}")
 
-                if index < len(urls) and SERVER_INTERVAL:
-                    log(f"⏱️ 等待 {SERVER_INTERVAL} 秒后处理下一台...")
-                    time.sleep(SERVER_INTERVAL)
+                        try:
+                            page.screenshot(
+                                path=f"hostship_{sid}_error.png",
+                                full_page=True,
+                            )
+                        except Exception:
+                            pass
 
-        finally:
-            browser.close()
+                        record_error(sid, "❌ 自动续期异常", str(exc))
+
+                        code = 1
+
+                    results[sid] = code
+
+                    # 登录/验证码问题对同一账号的所有服务器都一样，不再继续
+                    if code == LOGIN_FAILED:
+                        for rest in urls[index:]:
+                            results[server_id(rest)] = LOGIN_FAILED
+                            record_skipped(server_id(rest), "登录失败")
+
+                        log("⛔ 登录失败，跳过剩余服务器")
+                        break
+
+                    if index < len(urls) and SERVER_INTERVAL:
+                        log(f"⏱️ 等待 {SERVER_INTERVAL} 秒后处理下一台...")
+                        time.sleep(SERVER_INTERVAL)
+
+            finally:
+                browser.close()
+
+    finally:
+        # 无论正常结束还是中途 return / 异常，都合并发送一次通知
+        flush_report(ip)
 
     failed = [sid for sid, code in results.items() if code != 0]
 
