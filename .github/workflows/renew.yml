@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: write   # 用于清理旧的运行记录
 
 # 防止手动运行和定时任务同时跑，重复点续期
 concurrency:
@@ -85,3 +86,19 @@ jobs:
         run: |
           pkill -f sing-box || true
           rm -f sing-box sing-box-config.json sing-box.log || true
+
+      - name: Cleanup old workflow runs (keep latest 3)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 按时间从新到旧列出本工作流所有运行，跳过最新 3 条（含当前这次），其余已完成的删除
+          gh api --paginate \
+            "repos/${{ github.repository }}/actions/workflows/renew.yml/runs?per_page=100" \
+            --jq '.workflow_runs[] | "\(.id) \(.status)"' \
+            | tail -n +4 \
+            | awk '$2 == "completed" {print $1}' \
+            | while read -r id; do
+                echo "Deleting run $id"
+                gh api -X DELETE "repos/${{ github.repository }}/actions/runs/$id" || true
+              done
