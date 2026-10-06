@@ -10,6 +10,7 @@
 - 手动运行时会发送 Telegram 检查结果
 - 真正续期成功、失败或异常时发送 Telegram
 - Telegram 中显示：
+  - 登录账号（从账号页读取，脱敏显示，如 `a***a@email.com`）
   - 服务器编号
   - 节点状态
   - 当前出口 IP
@@ -36,6 +37,16 @@
 Host-Ship 服务器详情页完整地址，例如：
 
 `https://panel.host-ship.com/server/xxxxxxxx`
+
+**支持多台服务器**：填多个地址即可，用换行、空格、逗号或分号分隔（重复的会自动去重），例如：
+
+```
+https://panel.host-ship.com/server/aaaaaaaa
+https://panel.host-ship.com/server/bbbbbbbb
+https://panel.host-ship.com/server/cccccccc
+```
+
+多台服务器需要属于同一个 Host-Ship 账号，只登录一次，依次检查并续期。每台服务器单独发送 Telegram 通知，某一台失败不影响其他台；如果登录失败或遇到验证码，会直接停止并跳过剩余服务器。
 
 `HOSTSHIP_LOGIN`
 

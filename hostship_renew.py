@@ -32,6 +32,58 @@ MANUAL_RUN = os.getenv(
 
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
+# 多台服务器之间的等待秒数（可用环境变量 SERVER_INTERVAL 调整）
+try:
+    SERVER_INTERVAL = max(0, int(os.getenv("SERVER_INTERVAL", "5")))
+except ValueError:
+    SERVER_INTERVAL = 5
+
+SERVER_URL_PREFIX = "https://panel.host-ship.com/server/"
+ACCOUNT_URL = "https://panel.host-ship.com/account"
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+LOGIN_FAILED = -1
+
+
+def mask_email(email):
+    """a***a@email.com：保留本地部分首尾各一个字符和完整域名。"""
+    local, sep, domain = email.strip().partition("@")
+
+    if not sep or not local:
+        return "***"
+
+    if len(local) <= 2:
+        return f"{local[0]}***@{domain}"
+
+    return f"{local[0]}***{local[-1]}@{domain}"
+
+
+# 登录账号（脱敏）。登录前先用 HOSTSHIP_LOGIN 兜底，登录后从账号页读取
+ACCOUNT = {
+    "masked": (
+        mask_email(HOSTSHIP_LOGIN)
+        if "@" in HOSTSHIP_LOGIN
+        else "未知"
+    ),
+    "fetched": False,
+}
+
+
+def account_text():
+    return ACCOUNT["masked"]
+
+
+def parse_server_urls(raw):
+    """SERVER_URL 支持多个地址，用换行 / 空格 / 逗号 / 分号分隔，自动去重。"""
+    urls = []
+
+    for item in re.split(r"[\s,;]+", raw.strip()):
+        item = item.strip()
+
+        if item and item not in urls:
+            urls.append(item)
+
+    return urls
+
 
 def log(msg):
     print(
@@ -40,11 +92,11 @@ def log(msg):
     )
 
 
-def server_id():
-    if not SERVER_URL:
+def server_id(url):
+    if not url:
         return "未知"
 
-    return SERVER_URL.rstrip("/").split("/")[-1]
+    return url.rstrip("/").split("/")[-1]
 
 
 def node_status():
@@ -156,7 +208,7 @@ def current_ip():
         return "获取失败"
 
 
-def build_check_message(status, ip):
+def build_check_message(sid, status, ip):
     days = get_days(status)
     renew_date = estimate_renew_date(status)
     now = beijing_now()
@@ -164,7 +216,8 @@ def build_check_message(status, ip):
     lines = [
         "⏳ Host-Ship 检查完成",
         "",
-        f"🖥️ 服务器：#{server_id()}",
+        f"🖥️ 服务器：#{sid}",
+        f"👤 账号：{account_text()}",
         f"🌐 节点状态：{node_status()}",
         f"📍 出口IP：{ip}",
         f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
@@ -195,7 +248,7 @@ def build_check_message(status, ip):
     return "\n".join(lines)
 
 
-def build_success_message(before, after, ip):
+def build_success_message(sid, before, after, ip):
     before_days = get_days(before)
     after_days = get_days(after)
     now = beijing_now()
@@ -203,7 +256,8 @@ def build_success_message(before, after, ip):
     lines = [
         "🎉 Host-Ship 续期成功",
         "",
-        f"🖥️ 服务器：#{server_id()}",
+        f"🖥️ 服务器：#{sid}",
+        f"👤 账号：{account_text()}",
         f"🌐 节点状态：{node_status()}",
         f"📍 出口IP：{ip}",
         f"🕗 续期时间：{now.strftime('%Y/%m/%d %H:%M')}",
@@ -235,12 +289,13 @@ def build_success_message(before, after, ip):
     return "\n".join(lines)
 
 
-def build_error_message(title, reason, ip):
+def build_error_message(sid, title, reason, ip):
     now = beijing_now()
 
     return (
         f"{title}\n\n"
-        f"🖥️ 服务器：#{server_id()}\n"
+        f"🖥️ 服务器：#{sid}\n"
+        f"👤 账号：{account_text()}\n"
         f"🌐 节点状态：{node_status()}\n"
         f"📍 出口IP：{ip}\n"
         f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}\n\n"
@@ -267,12 +322,30 @@ def first_visible(page, selectors):
     return None
 
 
-def login_if_needed(page):
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+def goto_retry(page, url, tries=3):
+    """打开页面，网络抖动时自动重试。"""
+    for attempt in range(1, tries + 1):
+        try:
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            return
+
+        except Exception as exc:
+            if attempt == tries:
+                raise
+
+            log(
+                f"⚠️ 打开页面失败（第 {attempt} 次）：{exc}，"
+                "5 秒后重试"
+            )
+            time.sleep(5)
+
+
+def login_if_needed(page, url):
+    goto_retry(page, url)
 
     time.sleep(2)
 
@@ -366,11 +439,7 @@ def login_if_needed(page):
         )
         return False
 
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+    goto_retry(page, url)
 
     page.wait_for_timeout(2000)
 
@@ -564,44 +633,215 @@ def wait_for_renewal_result(page, before):
     return False, after
 
 
+def fetch_account_email(page):
+    """打开账号页，读取邮箱输入框里的邮箱；失败返回 None。"""
+    try:
+        goto_retry(page, ACCOUNT_URL)
+
+        try:
+            page.wait_for_function(
+                "() => [...document.querySelectorAll('input')]"
+                ".some(i => (i.value || '').includes('@'))",
+                timeout=10000,
+            )
+        except Exception:
+            pass
+
+        values = page.eval_on_selector_all(
+            "input",
+            "els => els.map(e => e.value || '')",
+        )
+
+        for value in values:
+            value = value.strip()
+
+            if EMAIL_RE.match(value):
+                return value
+
+    except Exception as exc:
+        log(f"⚠️ 读取账号邮箱失败：{exc}")
+
+    return None
+
+
+def notify_not_due(sid, status, ip):
+    """未到续期时间：仅手动运行时发 Telegram。"""
+    if MANUAL_RUN:
+        tg(build_check_message(sid, status, ip))
+
+
+def process_server(page, url, sid, ip):
+    """处理单台服务器，返回 0 成功/无需操作，1 失败，LOGIN_FAILED 登录失败。"""
+    if not login_if_needed(page, url):
+        page.screenshot(
+            path=f"hostship_{sid}_login_fail.png",
+            full_page=True,
+        )
+
+        tg(
+            build_error_message(
+                sid,
+                "❌ Host-Ship 登录失败",
+                "登录失败或遇到安全验证",
+                ip,
+            )
+        )
+
+        return LOGIN_FAILED
+
+    if not ACCOUNT["fetched"]:
+        ACCOUNT["fetched"] = True
+
+        email = fetch_account_email(page)
+
+        if email:
+            ACCOUNT["masked"] = mask_email(email)
+            log(f"👤 登录账号：{ACCOUNT['masked']}")
+        else:
+            log("⚠️ 未能从账号页读取邮箱，使用兜底值")
+
+        # 回到服务器页面继续
+        goto_retry(page, url)
+        page.wait_for_timeout(2000)
+
+    log("✅ 页面已就绪")
+
+    before = get_renewal_text(page)
+
+    log(f"📅 当前续期状态：{before}")
+
+    body = page.locator("body").inner_text()
+
+    if re.search(r"Renew\s+Limit\s+Reached", body, re.I):
+        log("⏳ 目前未到续期时间，不进行操作")
+
+        notify_not_due(sid, before, ip)
+
+        return 0
+
+    button = find_renew_button(page)
+
+    if not button:
+        page.screenshot(
+            path=f"hostship_{sid}_no_renew_button.png",
+            full_page=True,
+        )
+
+        tg(
+            build_error_message(
+                sid,
+                "⚠️ Host-Ship 需要检查",
+                f"没有找到可用的 Renew 按钮；{before}",
+                ip,
+            )
+        )
+
+        return 1
+
+    try:
+        disabled = button.is_disabled()
+    except Exception:
+        disabled = False
+
+    if disabled:
+        log("⏳ Renew 按钮当前不可点击")
+
+        notify_not_due(sid, before, ip)
+
+        return 0
+
+    log("🔄 已到续期窗口，点击 Renew...")
+
+    button.click()
+
+    if not confirm_renewal(page):
+        page.screenshot(
+            path=f"hostship_{sid}_confirm_fail.png",
+            full_page=True,
+        )
+
+        tg(
+            build_error_message(
+                sid,
+                "❌ Host-Ship 续期确认失败",
+                "点击第一层 Renew 后，未能点击确认弹窗中的 Renew now",
+                ip,
+            )
+        )
+
+        return 1
+
+    success, after = wait_for_renewal_result(page, before)
+
+    if success:
+        log(f"✅ 续期成功：{before} -> {after}")
+
+        tg(build_success_message(sid, before, after, ip))
+
+        return 0
+
+    page.screenshot(
+        path=f"hostship_{sid}_renew_uncertain.png",
+        full_page=True,
+    )
+
+    log("⚠️ 已点击续期，但无法确认结果")
+
+    tg(
+        build_error_message(
+            sid,
+            "⚠️ Host-Ship 续期结果需要检查",
+            f"续期前：{before}；续期后：{after}",
+            ip,
+        )
+    )
+
+    return 1
+
+
 def main():
-    if not SERVER_URL.startswith(
-        "https://panel.host-ship.com/server/"
-    ):
-        log("❌ SERVER_URL 不正确")
+    urls = parse_server_urls(SERVER_URL)
+
+    if not urls:
+        log("❌ 未配置 SERVER_URL")
 
         tg(
             "❌ Host-Ship 配置错误\n"
-            "SERVER_URL 不是服务器详情页地址"
+            "未配置 SERVER_URL"
+        )
+
+        return 1
+
+    bad = [u for u in urls if not u.startswith(SERVER_URL_PREFIX)]
+
+    if bad:
+        log(f"❌ SERVER_URL 不正确：{bad}")
+
+        tg(
+            "❌ Host-Ship 配置错误\n"
+            f"有 {len(bad)} 个地址不是服务器详情页地址"
         )
 
         return 1
 
     log("======================================")
     log(" Host-Ship Free Auto Renew")
+    log(f" 服务器数量：{len(urls)}")
     log("======================================")
 
-    log(
-        f"🌐 节点状态：{node_status()}"
-    )
+    log(f"🌐 节点状态：{node_status()}")
 
     ip = current_ip()
 
-    log(
-        f"📍 当前出口IP：{ip}"
-    )
+    log(f"📍 当前出口IP：{ip}")
+
+    results = {}
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            proxy={
-                "server": PROXY_SERVER
-            }
-            if IS_PROXY
-            else None,
-            args=[
-                "--no-sandbox"
-            ],
+            proxy={"server": PROXY_SERVER} if IS_PROXY else None,
+            args=["--no-sandbox"],
         )
 
         context = browser.new_context(
@@ -621,191 +861,64 @@ def main():
         page = context.new_page()
 
         try:
-            if not login_if_needed(page):
-                page.screenshot(
-                    path="hostship_login_fail.png",
-                    full_page=True,
-                )
+            for index, url in enumerate(urls, start=1):
+                sid = server_id(url)
 
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 登录失败",
-                        "登录失败或遇到安全验证",
-                        ip,
-                    )
-                )
+                log(f"━━ [{index}/{len(urls)}] 服务器 #{sid} ━━")
 
-                return 1
+                try:
+                    code = process_server(page, url, sid, ip)
 
-            log("✅ 登录成功")
+                except Exception as exc:
+                    log(f"❌ 运行异常：{exc}")
 
-            before = get_renewal_text(page)
+                    try:
+                        page.screenshot(
+                            path=f"hostship_{sid}_error.png",
+                            full_page=True,
+                        )
+                    except Exception:
+                        pass
 
-            log(
-                f"📅 当前续期状态：{before}"
-            )
-
-            body = page.locator(
-                "body"
-            ).inner_text()
-
-            if re.search(
-                r"Renew\s+Limit\s+Reached",
-                body,
-                re.I,
-            ):
-                log(
-                    "⏳ 目前未到续期时间，"
-                    "不进行操作"
-                )
-
-                if MANUAL_RUN:
                     tg(
-                        build_check_message(
-                            before,
+                        build_error_message(
+                            sid,
+                            "❌ Host-Ship 自动续期异常",
+                            str(exc),
                             ip,
                         )
                     )
 
-                return 0
+                    code = 1
 
-            button = find_renew_button(page)
+                results[sid] = code
 
-            if not button:
-                page.screenshot(
-                    path="hostship_no_renew_button.png",
-                    full_page=True,
-                )
+                # 登录/验证码问题对同一账号的所有服务器都一样，不再继续
+                if code == LOGIN_FAILED:
+                    for rest in urls[index:]:
+                        results[server_id(rest)] = LOGIN_FAILED
 
-                tg(
-                    build_error_message(
-                        "⚠️ Host-Ship 需要检查",
-                        (
-                            "没有找到可用的 "
-                            f"Renew 按钮；{before}"
-                        ),
-                        ip,
-                    )
-                )
+                    log("⛔ 登录失败，跳过剩余服务器")
+                    break
 
-                return 1
-
-            try:
-                disabled = button.is_disabled()
-
-            except Exception:
-                disabled = False
-
-            if disabled:
-                log(
-                    "⏳ Renew 按钮当前不可点击"
-                )
-
-                if MANUAL_RUN:
-                    tg(
-                        build_check_message(
-                            before,
-                            ip,
-                        )
-                    )
-
-                return 0
-
-            log(
-                "🔄 已到续期窗口，"
-                "点击 Renew..."
-            )
-
-            button.click()
-
-            if not confirm_renewal(page):
-                page.screenshot(
-                    path="hostship_confirm_fail.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 续期确认失败",
-                        (
-                            "点击第一层 Renew 后，"
-                            "未能点击确认弹窗中的 Renew now"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
-
-            success, after = wait_for_renewal_result(
-                page,
-                before,
-            )
-
-            if success:
-                log(
-                    "✅ 续期成功："
-                    f"{before} -> {after}"
-                )
-
-                tg(
-                    build_success_message(
-                        before,
-                        after,
-                        ip,
-                    )
-                )
-
-                return 0
-
-            page.screenshot(
-                path="hostship_renew_uncertain.png",
-                full_page=True,
-            )
-
-            log(
-                "⚠️ 已点击续期，"
-                "但无法确认结果"
-            )
-
-            tg(
-                build_error_message(
-                    "⚠️ Host-Ship 续期结果需要检查",
-                    (
-                        f"续期前：{before}；"
-                        f"续期后：{after}"
-                    ),
-                    ip,
-                )
-            )
-
-            return 1
-
-        except Exception as exc:
-            log(
-                f"❌ 运行异常：{exc}"
-            )
-
-            try:
-                page.screenshot(
-                    path="hostship_error.png",
-                    full_page=True,
-                )
-            except Exception:
-                pass
-
-            tg(
-                build_error_message(
-                    "❌ Host-Ship 自动续期异常",
-                    str(exc),
-                    ip,
-                )
-            )
-
-            return 1
+                if index < len(urls) and SERVER_INTERVAL:
+                    log(f"⏱️ 等待 {SERVER_INTERVAL} 秒后处理下一台...")
+                    time.sleep(SERVER_INTERVAL)
 
         finally:
             browser.close()
+
+    failed = [sid for sid, code in results.items() if code != 0]
+
+    log("======================================")
+    log(f" 完成：成功/无需操作 {len(results) - len(failed)}，失败 {len(failed)}")
+
+    for sid, code in results.items():
+        log(f"   #{sid}: {'OK' if code == 0 else 'FAIL'}")
+
+    log("======================================")
+
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
