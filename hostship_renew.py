@@ -40,6 +40,10 @@ except ValueError:
 
 SERVER_URL_PREFIX = "https://panel.host-ship.com/server/"
 ACCOUNT_URL = "https://panel.host-ship.com/account"
+DASHBOARD_URL = "https://panel.host-ship.com/"
+SERVER_LINK_RE = re.compile(
+    r"^https://panel\.host-ship\.com/server/([A-Za-z0-9-]+)"
+)
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 LOGIN_FAILED = -1
 
@@ -344,7 +348,15 @@ def goto_retry(page, url, tries=3):
             time.sleep(5)
 
 
-def login_if_needed(page, url):
+def page_ok(page, expect):
+    """expect 为 None 时（如仪表盘），只要没被重定向到登录页就算成功。"""
+    if expect:
+        return expect in page.url
+
+    return "/auth" not in page.url
+
+
+def login_if_needed(page, url, expect="/server/"):
     goto_retry(page, url)
 
     time.sleep(2)
@@ -354,7 +366,7 @@ def login_if_needed(page, url):
     ).inner_text().lower()
 
     if (
-        "/server/" in page.url
+        page_ok(page, expect)
         and "password" not in body
     ):
         return True
@@ -443,7 +455,7 @@ def login_if_needed(page, url):
 
     page.wait_for_timeout(2000)
 
-    return "/server/" in page.url
+    return page_ok(page, expect)
 
 
 def get_renewal_text(page):
@@ -664,6 +676,38 @@ def fetch_account_email(page):
     return None
 
 
+def discover_servers(page):
+    """登录后扫描仪表盘上的服务器。登录失败返回 None，没找到返回 []。"""
+    if not login_if_needed(page, DASHBOARD_URL, expect=None):
+        return None
+
+    try:
+        page.wait_for_selector(
+            'a[href*="/server/"]',
+            timeout=15000,
+        )
+    except Exception:
+        pass
+
+    hrefs = page.eval_on_selector_all(
+        'a[href*="/server/"]',
+        "els => els.map(e => e.href)",
+    )
+
+    urls = []
+
+    for href in hrefs:
+        match = SERVER_LINK_RE.match(href)
+
+        if match:
+            url = SERVER_URL_PREFIX + match.group(1)
+
+            if url not in urls:
+                urls.append(url)
+
+    return urls
+
+
 def notify_not_due(sid, status, ip):
     """未到续期时间：仅手动运行时发 Telegram。"""
     if MANUAL_RUN:
@@ -802,16 +846,6 @@ def process_server(page, url, sid, ip):
 def main():
     urls = parse_server_urls(SERVER_URL)
 
-    if not urls:
-        log("❌ 未配置 SERVER_URL")
-
-        tg(
-            "❌ Host-Ship 配置错误\n"
-            "未配置 SERVER_URL"
-        )
-
-        return 1
-
     bad = [u for u in urls if not u.startswith(SERVER_URL_PREFIX)]
 
     if bad:
@@ -826,7 +860,7 @@ def main():
 
     log("======================================")
     log(" Host-Ship Free Auto Renew")
-    log(f" 服务器数量：{len(urls)}")
+    log(f" 服务器数量：{len(urls) if urls else '自动扫描'}")
     log("======================================")
 
     log(f"🌐 节点状态：{node_status()}")
@@ -861,6 +895,53 @@ def main():
         page = context.new_page()
 
         try:
+            if not urls:
+                log("🔎 未配置 SERVER_URL，自动扫描账号下的服务器...")
+
+                found = discover_servers(page)
+
+                if found is None:
+                    page.screenshot(
+                        path="hostship_discover_login_fail.png",
+                        full_page=True,
+                    )
+
+                    tg(
+                        build_error_message(
+                            "自动扫描",
+                            "❌ Host-Ship 登录失败",
+                            "登录失败或遇到安全验证",
+                            ip,
+                        )
+                    )
+
+                    return 1
+
+                if not found:
+                    page.screenshot(
+                        path="hostship_discover_empty.png",
+                        full_page=True,
+                    )
+
+                    tg(
+                        build_error_message(
+                            "自动扫描",
+                            "⚠️ Host-Ship 未发现服务器",
+                            "仪表盘上没有找到服务器链接，"
+                            "请改为手动配置 SERVER_URL",
+                            ip,
+                        )
+                    )
+
+                    return 1
+
+                urls = found
+
+                log(
+                    f"✅ 发现 {len(urls)} 台服务器："
+                    + ", ".join(server_id(u) for u in urls)
+                )
+
             for index, url in enumerate(urls, start=1):
                 sid = server_id(url)
 
